@@ -1,0 +1,431 @@
+# Copyright 2019-2024 Tauri Programme within The Commons Conservancy
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
+
+name: OHOS PR Review (Gate 1)
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - 'crates/**'
+      - 'examples/**'
+      - 'packages/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ═══════════════════════════════════════════════════
+  # ① Host 平台编译检查（3 平台矩阵）
+  # 确保 PR 不破坏 Windows/macOS/Linux 编译
+  # ═══════════════════════════════════════════════════
+  host-compile-check:
+    name: Host Compile (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            toolchain: '1.77.2'
+          - name: macOS
+            os: macos-14
+            target: aarch64-apple-darwin
+            toolchain: '1.77.2'
+          - name: Linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            toolchain: '1.77.2'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev webkit2gtk-4.1 libayatana-appindicator3-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gate1-${{ matrix.target }}
+
+      - name: cargo check
+        run: cargo check --target ${{ matrix.target }} --all-targets
+
+  # ═══════════════════════════════════════════════════
+  # ⑤ Host 单元测试（Linux）
+  # ═══════════════════════════════════════════════════
+  host-tests:
+    name: Host Tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.77.2'
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev webkit2gtk-4.1 libayatana-appindicator3-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gate1-test-linux
+
+      - name: cargo test
+        run: cargo test --workspace --lib --bins --tests
+
+  # ═══════════════════════════════════════════════════
+  # OHOS 模式静态检查（轻量 grep）
+  # 扫描 PR diff 中的常见 OHOS 违规模式
+  # ═══════════════════════════════════════════════════
+  ohos-pattern-lint:
+    name: OHOS Pattern Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan PR diff for OHOS violations
+        id: lint
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // ── 违规模式定义 ──
+            const patterns = [
+              {
+                regex: /callee_handled\s*::\s*<\s*true\s*>/,
+                severity: '🔴 Blocker',
+                title: 'TSFN callee_handled 参数错误',
+                rule: '必须使用 callee_handled::<false>()。napi-ohos 在 CalleeHandled=true 时自动在首位插入 null，导致参数偏移'
+              },
+              {
+                regex: /run_on_main_thread[\s\S]{0,200}\.recv\s*\(/,
+                severity: '🔴 Blocker',
+                title: '线程模型违规: 死锁风险',
+                rule: 'run_on_main_thread + 阻塞 recv() 会导致死锁。Chrome_IOThread 等 ArkTS 主线程，ArkTS 主线程等 Chrome_IOThread'
+              },
+              {
+                regex: /target_os\s*=\s*"linux"(?!.*not\s*\(\s*target_env\s*=\s*"ohos"\s*\))/,
+                severity: '🔴 Blocker',
+                title: 'Linux 依赖缺少 OHOS 排除',
+                rule: 'OHOS 的 target_os 是 "linux"，Linux 依赖必须加 not(target_env = "ohos") 排除'
+              },
+              {
+                regex: /global\s+Mutex\s*<\s*Option/,
+                severity: '🟡 Major',
+                title: 'TSFN 数据传递方式不推荐',
+                rule: '全局 Mutex<Option<Data>> 在快速连续调用时产生数据竞态。应通过泛型参数携带数据'
+              },
+              {
+                regex: /mock_app\s*\(\s*\)|mock_builder\s*\(\s*\)/,
+                severity: '🟡 Major',
+                title: 'mock_runtime 在 OHOS 上不可用',
+                rule: 'mock_runtime 依赖 tao EventLoop (desktop-only)，测试模块需用 cfg(not(target_env = "ohos")) 排除'
+              }
+            ];
+
+            // ── 获取 PR diff ──
+            const prNumber = context.payload.pull_request.number;
+            const diff = await github.request(
+              `GET /repos/${context.repo.owner}/${context.repo.repo}/pulls/${prNumber}`,
+              { mediaType: { format: 'diff' } }
+            );
+
+            // ── 解析 diff: 按文件分组，提取新增行 ──
+            const diffText = typeof diff.data === 'string' ? diff.data : String(diff.data);
+            const fileSections = diffText.split(/^diff --git /m).slice(1);
+            const results = [];
+
+            for (const section of fileSections) {
+              const headerMatch = section.match(/a\/(.+?) b\/(.+)/);
+              const filePath = headerMatch ? headerMatch[2] : 'unknown';
+
+              const addedLines = section.split('\n')
+                .filter(l => l.startsWith('+') && !l.startsWith('+++'))
+                .map(l => l.slice(1));
+
+              for (const pattern of patterns) {
+                for (let i = 0; i < addedLines.length; i++) {
+                  if (pattern.regex.test(addedLines[i])) {
+                    results.push({
+                      file: filePath,
+                      line: i + 1,
+                      severity: pattern.severity,
+                      title: pattern.title,
+                      rule: pattern.rule,
+                      matched: addedLines[i].trim().substring(0, 120)
+                    });
+                  }
+                }
+              }
+            }
+
+            // ── 构建报告 ──
+            let body;
+            if (results.length === 0) {
+              body = '### 🔍 OHOS Pattern Lint\n\n✅ 未发现已知 OHOS 违规模式';
+            } else {
+              body = `### 🔍 OHOS Pattern Lint — 发现 ${results.length} 个潜在问题\n\n`;
+              body += '| 文件 | 严重级别 | 问题 | 规则说明 |\n';
+              body += '|------|----------|------|----------|\n';
+              for (const r of results) {
+                body += `| \`${r.file}\` | ${r.severity} | **${r.title}** | ${r.rule} |\n`;
+              }
+            }
+
+            core.setOutput('body', body);
+            core.setOutput('violation_count', results.length.toString());
+
+            // 标记 blocker 为 job 失败
+            const blockers = results.filter(r => r.severity.includes('Blocker'));
+            if (blockers.length > 0) {
+              core.setFailed(`发现 ${blockers.length} 个 Blocker 级 OHOS 违规`);
+            }
+
+      - name: Post pattern lint comment
+        if: always() && steps.lint.outputs.body
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.payload.pull_request.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: process.env.LINT_BODY
+            });
+        env:
+          LINT_BODY: ${{ steps.lint.outputs.body }}
+
+  # ═══════════════════════════════════════════════════
+  # ⑥ Claude AI 代码检视
+  # 基于 OHOS 约束 checklist 进行深度审查
+  # 需要 repo secrets:
+  #   - ANTHROPIC_API_KEY: API 密钥
+  #   - ANTHROPIC_BASE_URL (可选): 自定义 API 端点（如 DashScope 代理）
+  # ═══════════════════════════════════════════════════
+  claude-review:
+    name: Claude Code Review
+    needs: [host-compile-check, host-tests]
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+    steps:
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            你是 Tauri OHOS 适配项目的代码检视助手。请逐项审查此 PR 的代码变更。
+
+            ## Step 1: 获取 PR 完整 diff
+
+            ```bash
+            # 确保完整历史（Actions 默认浅克隆）
+            git fetch --unshallow origin ${{ github.base_ref }}
+            BASE_REF=${{ github.base_ref }}
+            FULL_DIFF=$(git diff origin/$BASE_REF...HEAD -- . ':!openspec/')
+            ```
+
+            ## Step 2: 检测 openspec 变更
+
+            ```bash
+            OPENSPEC_FILES=$(git diff --name-only origin/$BASE_REF...HEAD -- 'openspec/')
+            echo "$OPENSPEC_FILES"
+            ```
+
+            如果输出包含 `openspec/changes/<name>/` 路径，说明此 PR 有 openspec 变更。
+            读取该 change 目录下的所有文件：
+            - `openspec/changes/<name>/proposal.md` — 变更目标和范围
+            - `openspec/changes/<name>/design.md` — 技术设计决策
+            - `openspec/changes/<name>/tasks.md` — 实现任务清单
+            - `openspec/changes/<name>/specs/*/spec.md` — 所有 capability spec（每个 spec 包含 requirements 和 scenarios）
+
+            从 spec.md 中提取所有 **requirements**（以 `### Requirement:` 开头的段落），
+            作为 **G. Spec 合规** 部分的逐条检查依据。
+
+            如果 `OPENSPEC_FILES` 为空，跳过 G 部分。
+
+            ## Step 3: 逐项审查
+
+            对照以下清单检查 PR diff，每项标注 ✅ 通过 / ❌ 违规 / ⚠️ 无法判断。
+
+            ### A. cfg 隔离
+            - [ ] OHOS 特有代码使用 `cfg(target_env = "ohos")` 或组合
+            - [ ] Linux 依赖加了 `not(target_env = "ohos")` 排除（OHOS target_os 是 "linux"）
+            - [ ] desktop/mobile 区分使用 `cfg(all(target_env = "ohos", desktop/mobile))`
+
+            ### B. NAPI/TSFN 规范
+            - [ ] ArkTS 中 NAPI 函数名使用 camelCase（Rust snake_case 自动转换）
+            - [ ] TSFN 使用 `callee_handled::<false>()`（true 导致参数偏移）
+            - [ ] TSFN 数据通过泛型参数携带，非全局 `Mutex<Option<Data>>`
+            - [ ] tuple 参数使用 `FnArgs<>` 包装
+
+            ### C. 线程模型
+            - [ ] 无 `run_on_main_thread` + 阻塞 `rx.recv()` 模式（死锁风险）
+            - [ ] Mutex 未跨越阻塞 I/O 操作持有
+            - [ ] `Function::call()` 未在 `render()` / `@Builder` 上下文中调用（OHOS 上静默失败）
+
+            ### D. ArkTS 框架约束
+            - [ ] 需要 `this` 的 `@Builder` 在 `@Component` 内（模块级 @Builder 无 this）
+            - [ ] `onLoadIntercept` 返回值已反转 `!ret`（语义与 Tauri on_navigation 相反）
+            - [ ] WebView 事件在 `@Builder` 内 pre-build 注册
+            - [ ] 多窗口状态使用 `@LocalStorageProp` 隔离（FloatPage），非全局 `@StorageProp`
+            - [ ] `setColorMode` 异步调用（`setTimeout(..., 0)`）避免死锁
+
+            ### E. 平台隔离
+            - [ ] Windows/macOS/Linux 原有实现未受影响
+            - [ ] 无遗漏的 cfg gate（检查 diff 中非 OHOS 路径的修改）
+            - [ ] 无不必要的修改（格式化、空白等与 PR 目标无关的变更）
+
+            ### F. 架构约束
+            - [ ] 所有仓通过 `openharmony-ability` 调用鸿蒙系统能力（禁止直接调用 ArkTS/NAPI）
+            - [ ] `TAURI_OHOS_DEVICE_TYPE` 正确控制 desktop/mobile 形态
+
+            ### G. Spec 合规（仅当 Step 1 找到 openspec 时检查）
+
+            从 Step 1 读取的 spec 中提取所有 requirements，逐条检查：
+            - [ ] 每个 requirement 都有对应实现
+            - [ ] 接口签名与 spec 一致
+            - [ ] 不支持的 API 按设计做了 stub/fallback
+            - [ ] tasks.md 中所有 task 都已实现
+            - [ ] 实现未超出 spec 范围（多余的未测试功能）
+
+            ## Step 4: 输出审查报告
+
+            格式：
+            ```
+            ## OHOS PR 检视报告
+
+            ### 审查清单
+            A. cfg 隔离
+            - [x] OHOS 特有代码使用 cfg 隔离 ✅
+            - [ ] Linux 依赖排除 ❌ — 发现 2 处遗漏（见下方）
+            ...
+
+            ### 发现的问题
+            | 文件:行号 | 严重级别 | 分类 | 描述 | 修复建议 |
+            |-----------|----------|------|------|---------|
+            | src/xxx.rs:42 | 🔴 Blocker | cfg隔离 | 缺少 cfg gate | 添加 cfg(target_env = "ohos") |
+
+            ### 汇总
+            | 级别 | 数量 |
+            |------|------|
+            | 🔴 Blocker | 0 |
+            | 🟡 Major | 0 |
+            | 🔵 Minor | 0 |
+            | ℹ️ Suggestion | 0 |
+            ```
+
+            严重级别定义：
+            - 🔴 Blocker: 必须修复（死锁、数据损坏、平台破坏）
+            - 🟡 Major: 应修复（API 误用、cfg 遗漏、spec 不符）
+            - 🔵 Minor: 建议修复（不必要修改、超出 spec）
+            - ℹ️ Suggestion: 可选优化
+
+            如全部通过，输出 `✅ LGTM — No issues found`。
+
+            请用 `gh pr comment` 将审查结果发布为 PR 评论。
+
+  # ═══════════════════════════════════════════════════
+  # Gate 1 汇总
+  # 收集所有 job 结果，发布汇总评论
+  # ═══════════════════════════════════════════════════
+  gate1-summary:
+    name: Gate 1 Summary
+    needs: [host-compile-check, host-tests, ohos-pattern-lint, claude-review]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post Gate 1 summary comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const sha = pr.head.sha;
+
+            // 获取所有 check runs
+            const { data: checks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: sha,
+              per_page: 100
+            });
+
+            // 筛选 Gate 1 相关 jobs
+            const gate1Prefixes = [
+              'Host Compile', 'Host Tests',
+              'OHOS Pattern Lint', 'Claude Code Review'
+            ];
+            const relevant = checks.check_runs.filter(c =>
+              gate1Prefixes.some(p => c.name.startsWith(p))
+            );
+
+            // 构建结果表格
+            let allPassed = true;
+            let rows = '';
+            for (const check of relevant) {
+              let status = '⏳ 运行中';
+              if (check.conclusion === 'success') {
+                status = '✅ 通过';
+              } else if (check.conclusion === 'failure') {
+                status = '❌ 失败';
+                allPassed = false;
+              } else if (check.conclusion === 'skipped') {
+                status = '⏭️ 跳过';
+              } else if (check.conclusion) {
+                status = `⚠️ ${check.conclusion}`;
+                allPassed = false;
+              }
+              rows += `| ${check.name} | ${status} |\n`;
+            }
+
+            // 构建评论
+            let body;
+            if (allPassed && relevant.length > 0) {
+              body = '## ✅ Gate 1 通过\n\n';
+              body += '| 检查项 | 结果 |\n|--------|------|\n';
+              body += rows;
+              body += '\n### ⏭️ 等待 Gate 2: 上机验证\n\n';
+              body += '请 Committer 执行:\n';
+              body += '```bash\n';
+              body += `gh pr checkout ${pr.number}\n`;
+              body += '# OHOS 单元测试 (需连接设备)\n';
+              body += 'cargo test-ohos\n';
+              body += '# OHOS API 自测 (需连接设备)\n';
+              body += '/opsx:verify\n';
+              body += '```\n\n';
+              body += '上机验证内容:\n';
+              body += '- [ ] OHOS 单元测试 (`cargo test-ohos`)\n';
+              body += '- [ ] OHOS API 自测 (autotest)\n';
+              body += '- [ ] 手动功能验证 (如需)\n';
+            } else {
+              body = '## ❌ Gate 1 未通过\n\n';
+              body += '| 检查项 | 结果 |\n|--------|------|\n';
+              body += rows;
+              body += '\n请修复以上问题后重新提交。\n';
+            }
+
+            await github.rest.issues.createComment({
+              issue_number: pr.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
