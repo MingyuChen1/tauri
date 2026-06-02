@@ -84,9 +84,8 @@ jobs:
           echo "::endgroup::"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.toolchain }}
           targets: ${{ matrix.target }}
 
       - name: Install Linux dependencies
@@ -132,9 +131,7 @@ jobs:
             echo "⚠️ Failed to clone plugins-workspace, skipping"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: '1.77.2'
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install Linux dependencies
         run: |
