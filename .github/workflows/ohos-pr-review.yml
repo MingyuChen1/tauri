@@ -204,7 +204,7 @@ jobs:
               { mediaType: { format: 'diff' } }
             );
 
-            // ── 解析 diff: 按文件分组，提取新增行 ──
+            // ── 解析 diff: 按文件分组，提取新增行（仅扫描 Rust 和 ArkTS 文件）──
             const diffText = typeof diff.data === 'string' ? diff.data : String(diff.data);
             const fileSections = diffText.split(/^diff --git /m).slice(1);
             const results = [];
@@ -212,6 +212,9 @@ jobs:
             for (const section of fileSections) {
               const headerMatch = section.match(/a\/(.+?) b\/(.+)/);
               const filePath = headerMatch ? headerMatch[2] : 'unknown';
+
+              // 仅扫描 Rust (.rs) 和 ArkTS (.ets/.ts) 源文件
+              if (!/\.(rs|ets|ts)$/.test(filePath)) continue;
 
               const addedLines = section.split('\n')
                 .filter(l => l.startsWith('+') && !l.startsWith('+++'))
