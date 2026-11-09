@@ -1,0 +1,5 @@
+fn main() {
+    let x = Some(1);
+    let y = x.unwrap();
+    println!("{}", y);
+}
