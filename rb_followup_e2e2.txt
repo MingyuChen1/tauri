@@ -1,4 +1,4 @@
-line1 unwrap_or(0)
-line2 naming
+line1 unwrap
+line2 renamed
 line3 missing error
 line4 style
